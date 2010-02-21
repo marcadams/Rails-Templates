@@ -16,6 +16,17 @@ rake("gems:install", :sudo => true)
 generate(:rspec)
 generate(:cucumber)
 
+initializer 'form_field_errors.rb', %q{
+# Show form errors next to the field that's invalid
+ActionView::Base.field_error_proc = Proc.new do |html_tag, instance|
+  if html_tag =~ /<label/
+    %|<div class="fieldWithErrors">#{html_tag} <span class="error">#{[instance.error_message].join(', ')}</span></div>|
+  else
+    html_tag
+  end
+end
+}
+
 # Generate the UserSession model for authlogic
 generate(:session, "user_session")
 
@@ -133,7 +144,7 @@ file "app/controllers/application_controller.rb",
   def require_user
     unless current_user
       store_location
-      flash[:notice] = "You must be logged in to access this page"
+      flash[:error] = "You must be logged in to access this page"
       redirect_to new_user_session_url
       return false
     end
@@ -184,12 +195,15 @@ file "app/controllers/users_controller.rb",
 
   def create
     @user = User.new(params[:user])
-    @user.save!
-
-    redirect_to users_path
-    flash[:notice] = "User #{@user.login} added!"
-  rescue ActiveRecord::RecordInvalid
-    render :action => 'new'
+    respond_to do |format|
+      if @user.save
+        flash[:notice] = "User #{@user.login} added!"
+        format.html { redirect_to users_path }
+      else
+        flash[:error] = "Could not create new user!"
+        format.html { render :action => :new }
+      end
+    end
   end
 
   def edit
@@ -204,17 +218,14 @@ file "app/controllers/users_controller.rb",
         flash[:notice] = "Successfully updated: #{@user.login}"
         format.html { redirect_to(@user) }
       else
-        format.html { render :action => "edit" }
+        flash[:error] = "Unable to update user record"
+        format.html { render :action => :edit }
       end
     end
   end
 
   def show
-    if current_user
-      @user = @current_user
-    else
-      @user = User.find_by_login(params[:login])
-    end
+    @user = User.find_by_login(params[:login])
   end
 end
 }
@@ -236,6 +247,7 @@ file "app/controllers/user_sessions_controller.rb",
       flash[:notice] = "Login successful!"
       redirect_back_or_default root_url
     else
+      flash[:error] = "Unable to login with those credentials"
       render :action => :new
     end
   end
@@ -246,12 +258,14 @@ file "app/controllers/user_sessions_controller.rb",
     redirect_back_or_default root_url
   end
 end
+
 }
 
 rake("db:create:all")
 rake("db:migrate")
 
 # Setup routing
+route("map.profile_link '/:login', :controller => 'users', :action => 'show'") # This must go before other routes or else it will break when it's generated.
 route("map.resources :users")
 route("map.resource :user_session")
 route("map.root :controller => 'welcome', :action => 'index'")
@@ -267,7 +281,13 @@ file "app/views/users/_form.html.erb",
 %q{<div class="group">
   <%= f.label :login, t("activerecord.attributes.user.login", :default => "Login"), :class => :label %>
   <%= f.text_field :login, :class => 'text_field' %>
-  <span class="description">Ex: a simple text</span>
+  <span class="description">Ex: snugglebunny5000</span>
+</div>
+
+<div class="group">
+  <%= f.label :email, t("activerecord.attributes.user.email", :default => "E-mail Address"), :class => :label %>
+  <%= f.text_field :email, :class => 'text_field' %>
+  <span class="description">Ex: you@youremailhost.com</span>
 </div>
 
 <div class="group">
@@ -360,7 +380,7 @@ Spec::Runner.configure do |config|
   # in your config/boot.rb
   config.use_transactional_fixtures = true
   config.use_instantiated_fixtures  = false
-  config.fixture_path = RAILS_ROOT + '/spec/fixtures/'
+  config.include(AuthlogicHelperMethods)
 end
 }
 
@@ -402,14 +422,131 @@ describe User do
 end
 }
 
+file "spec/controllers/users_controller_spec.rb",
+%q{require 'spec_helper'
+
+describe UsersController, "GET" do
+
+  it "should show all users on the index" do
+    get :index
+    assigns[:users].should == []
+  end
+
+  it "should render the layouts/sign.html.erb layout with the new action" do
+    get :new
+    response.should render_layout('sign')
+  end
+
+  it "should edit the current user's profile on edit" do
+    login
+    get :edit
+    assigns[:user].login.should == "validuser"
+  end
+
+  it "should prompt for login when attempting to edit logged out" do
+    get :edit
+    response.should redirect_to(new_user_session_url)
+    flash[:error].should == "You must be logged in to access this page"
+  end
+
+  it "should show the proper user on the show view" do
+    login
+    get :show, :login => 'validuser'
+    assigns[:user].should == User.find_by_login('validuser')
+  end
+
+  it "should error when accessing /new when logged in" do
+    login
+    get :new
+    response.should redirect_to(root_url)
+    flash[:error].should == "You must be logged out to access this page"
+  end
+
+end
+
+describe UsersController, "POST" do
+
+  it "should save a new record" do
+    post :create, :user => Factory.attributes_for(:valid_user)
+    response.should redirect_to(users_path)
+    flash[:notice].should == "User validuser added!"
+  end
+
+  it "should show errors when record invalid" do
+    post :create, :user => Factory.attributes_for(:invalid_user_different_passwords)
+    response.should render_template(:new)
+    flash[:error].should == "Could not create new user!"
+  end
+
+end
+
+describe UsersController, "PUT" do
+
+  it "should edit the user record properly" do
+    login
+    put :update, :user => { :email => "newemail@email.com" }
+    response.should redirect_to(user_path(assigns[:user]))
+    flash[:notice].should == "Successfully updated: validuser"
+  end
+
+  it "should fail when editing a user with invalid email" do
+    login
+    put :update, :user => { :email => "a@bcom" }
+    response.should render_template(:edit)
+    flash[:error].should == "Unable to update user record"
+  end
+
+end
+}
+
+file "spec/controllers/user_sessions_controller_spec.rb",
+%q{require 'spec_helper'
+
+describe UserSessionsController, "POST" do
+
+  it "should redirect to requested page after logging in" do
+    @user = Factory(:valid_user)
+    post :create, :user_session => { :login => @user.login, :password => @user.password }
+    response.should redirect_to(root_url)
+    flash[:notice] = "Login successful!"
+  end
+
+  it "shouldn't login when credentials are invalid" do
+    @user = Factory(:valid_user)
+    post :create, :user_session => { :login => @user.login, :password => "false!" }
+    response.should render_template(:new)
+    flash[:error].should == "Unable to login with those credentials"
+  end
+
+end
+
+describe UserSessionsController, "GET" do
+
+  it "should create an empty UserSession when getting /new" do
+    get :new
+    assigns[:user_session].should be_an_instance_of(UserSession)
+  end
+
+end
+
+describe UserSessionsController, "DELETE" do
+
+  it "should destroy the session on logout" do
+    login
+    delete :destroy
+    response.should redirect_to(root_url)
+  end
+
+end
+}
+
 run("mkdir spec/support")
 
 file "spec/support/authlogic_helpers.rb",
 %q{module AuthlogicHelperMethods
 
   def valid_user(overrides={})
-    options = {:login => "validlogin", :email => "valid@email.com", :password => "password", :password_confirmation => "password"}
-    user = new_user(options)
+    user = Factory(:valid_user)
   end
 
   def current_user(stubs = {})
@@ -417,7 +554,7 @@ file "spec/support/authlogic_helpers.rb",
   end
 
   def current_user_session(stubs = {}, user_stubs = {})
-    @current_user_session ||= mock_model(UserSession, {:user => current_user(user_stubs)}.merge(stubs))
+    @current_user_session ||= UserSession.create(valid_user)
   end
 
   def login(user_session_stubs = {}, user_stubs = {})
@@ -428,6 +565,35 @@ file "spec/support/authlogic_helpers.rb",
     @user_session = nil
   end
 
+end
+}
+
+file "spec/support/layout_helpers.rb",
+%q{# Matches the layout rendered by the controller response.
+class RenderLayout
+  def initialize(expected)
+    @expected = 'layouts/' + expected
+  end
+
+  def matches?(controller)
+    @actual = controller.layout
+    @actual == @expected
+  end
+
+  def failure_message
+    return "render_layout expected #{@expected.inspect}, got #{@actual.inspect}", @expected, @actual
+  end
+
+  def negative_failure_message
+    return "render_layout expected #{@expected.inspect} not to equal #{@actual.inspect}", @expected, @actual
+  end
+end
+
+# Used as a validation method like render_template:
+#
+# response.should render_layout('application')
+def render_layout(expected)
+  RenderLayout.new(expected)
 end
 }
 
